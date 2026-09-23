@@ -30,6 +30,46 @@ for (const e of all) {
   Object.assign(e, traitOverrides[e.id] || {});
 }
 
+// add environments, parts, pros and cons from physics.js
+const envOf = new Map();
+for (const [env, ids] of Object.entries(environments)) {
+  for (const id of ids) {
+    if (!envOf.has(id)) envOf.set(id, []);
+    envOf.get(id).push(env);
+  }
+}
+
+// flatten a parts tree into a plain list of names. a [name, children] pair counts as a branch
+function flattenParts(tree) {
+  const out = [];
+  for (const node of tree || []) {
+    if (Array.isArray(node)) { out.push(node[0]); out.push(...flattenParts(node[1])); }
+    else out.push(node);
+  }
+  return out;
+}
+
+// estimate the reynolds number: speed times chord over viscosity.
+// chord comes from the middle span divided by the aspect ratio
+function reynolds(e) {
+  const v = speedMs[e.speed];
+  if (!e.span || !v) return null;
+  const chord = Math.sqrt(e.span[0] * e.span[1]) / aspectRatio[e.aspect];
+  return v * chord / fluids[e.fluid].viscosity;
+}
+const bandOf = re => flowBands.find(b => re < b.below);
+
+for (const e of all) {
+  e.env = envOf.get(e.id) || [];
+  e.parts = parts[e.id] || [];
+  e.partNames = flattenParts(e.parts);
+  e.pros = tradeoffs[e.id]?.pros || [];
+  e.cons = tradeoffs[e.id]?.cons || [];
+  e.fluid = fluidOf[e.id] || "air";
+  e.re = reynolds(e);
+  e.flow = e.re === null ? null : bandOf(e.re).name;
+}
+
 // tag -> every parent tag above it, so filters on a parent also catch children
 const parentsOf = new Map();
 for (const [parent, kids] of Object.entries(tagParents)) {
@@ -71,7 +111,9 @@ for (const set of synonyms) for (const w of set) synonymOf.set(w, set.filter(x =
     }
     if (e.span && !(e.span[0] > 0 && e.span[0] <= e.span[1])) warn("bad span", e.id, e.span);
   }
-  for (const [name, table] of [["span", spans], ["era", eraOf], ["facts", facts], ["tag patch", tagPatches]]) {
+  for (const [env, ids] of Object.entries(environments)) for (const id of ids) if (!byId.has(id)) warn("environment " + env + " for missing id", id);
+  for (const [id, f] of Object.entries(fluidOf)) if (!(f in fluids)) warn("unknown fluid", id, f);
+  for (const [name, table] of [["span", spans], ["era", eraOf], ["facts", facts], ["tag patch", tagPatches], ["parts", parts], ["tradeoffs", tradeoffs], ["fluid", fluidOf]]) {
     for (const id in table) if (!byId.has(id)) warn(name + " for missing id", id);
   }
   for (const [a, , b] of links) if (!byId.has(a) || !byId.has(b)) warn("broken link", a, b);
@@ -103,10 +145,16 @@ const fields = {
   aspect: e => e.aspect,
   era: e => e.era || "",
   fact: e => e.facts.join(" "),
+  env: e => e.env.join(" "),
+  part: e => e.partNames.join(" "),
+  pro: e => e.pros.join(" "),
+  con: e => e.cons.join(" "),
+  flow: e => e.flow || "",
+  fluid: e => e.fluid,
   id: e => e.id
 };
 // how much a hit in each field counts toward the score
-const weights = { name: 5, id: 4, tag: 3, example: 3, group: 2, flight: 2, material: 2, size: 1, speed: 1, aspect: 1, era: 1, note: 1, fact: 0.5 };
+const weights = { name: 5, id: 4, tag: 3, example: 3, env: 2, part: 2, group: 2, flight: 2, material: 2, flow: 1, fluid: 1, size: 1, speed: 1, aspect: 1, era: 1, note: 1, pro: 1, con: 1, fact: 0.5 };
 
 // ---------- measurements ----------
 
@@ -144,9 +192,30 @@ const tokenize = s => s.toLowerCase().split(/[^a-z0-9-]+/).filter(Boolean);
 const index = new Map(all.map(e => {
   const f = {};
   for (const k in fields) f[k] = fields[k](e).toLowerCase();
-  f.words = new Set(tokenize(Object.values(f).join(" ")));
+  f.tokens = tokenize(Object.values(f).join(" "));
+  f.words = new Set(f.tokens);
+  f.tf = new Map();
+  for (const w of f.tokens) f.tf.set(w, (f.tf.get(w) || 0) + 1);
   return [e.id, f];
 }));
+
+// bm25 ranking: rewards a word showing up often in one entry, rare words, and short entries
+const bm25 = (() => {
+  const k1 = 1.2, b = 0.75;
+  const n = index.size;
+  const avg = [...index.values()].reduce((s, f) => s + f.tokens.length, 0) / n;
+  const df = new Map();
+  for (const f of index.values()) for (const w of f.words) df.set(w, (df.get(w) || 0) + 1);
+  return (word, f) => {
+    // count prefix matches too, so "glid" still counts "glider"
+    let tf = 0, d = 0;
+    for (const [w, c] of f.tf) if (w.startsWith(word)) tf += c;
+    if (!tf) return 0;
+    for (const [w, c] of df) if (w.startsWith(word)) d = Math.max(d, c);
+    const idf = Math.log(1 + (n - d + 0.5) / (d + 0.5));
+    return idf * tf * (k1 + 1) / (tf + k1 * (1 - b + b * f.tokens.length / avg));
+  };
+})();
 
 // inverted index: word -> ids, used to skip entries that cannot match
 const postings = new Map();
@@ -279,6 +348,18 @@ function distance(a, b, limit = 2) {
   return prev[b.length];
 }
 
+// read "5000", "5k", "2.5m" (million), or "1e5" as a plain number
+function toNumber(text) {
+  const m = /^(\d+(?:\.\d+)?(?:e\d+)?)(k|m)?$/.exec(text);
+  return m ? parseFloat(m[1]) * ({ k: 1e3, m: 1e6 }[m[2]] || 1) : null;
+}
+
+// fields that hold numbers or number ranges, and how to read a typed value for each
+const numeric = {
+  span: { get: e => e.span, read: toMeters },
+  re: { get: e => e.re === null ? null : [e.re, e.re], read: toNumber }
+};
+
 // turn the search box into groups of terms. groups are split by | and mean "or".
 // inside a group every term must match. supports "phrases", -not, field:value, and scale compares like size>=large
 function parse(text) {
@@ -290,8 +371,8 @@ function parse(text) {
       const [, not, key, op, phrase, bare] = m;
       const word = phrase || bare || "";
       if (!word) continue;
-      if (key === "span" && op !== ":" && toMeters(word) !== null) {
-        terms.push({ not: !!not, span: true, op, value: toMeters(word) });
+      if (key in numeric && op !== ":" && numeric[key].read(word) !== null) {
+        terms.push({ not: !!not, num: key, op, value: numeric[key].read(word) });
       } else if (key && op !== ":" && key in scales) {
         terms.push({ not: !!not, scale: key, op, value: word.replace(/-/g, " ") });
       } else if (key && key in fields) {
@@ -309,10 +390,11 @@ const compare = { ">": (a, b) => a > b, "<": (a, b) => a < b, ">=": (a, b) => a 
 
 // score one term against one entry. exact hits beat synonyms, synonyms beat typos. 0 means no match
 function termScore(term, e, f) {
-  // span compares check if any part of the entry's range fits
-  if (term.span) {
-    if (!e.span) return 0;
-    const [lo, hi] = e.span, v = term.value;
+  // number compares check if any part of the entry's range fits
+  if (term.num) {
+    const range = numeric[term.num].get(e);
+    if (!range) return 0;
+    const [lo, hi] = range, v = term.value;
     const ok = { ">": hi > v, ">=": hi >= v, "<": lo < v, "<=": lo <= v, "=": lo <= v && v <= hi }[term.op];
     return ok ? 1 : 0;
   }
@@ -326,6 +408,8 @@ function termScore(term, e, f) {
   const hit = w => places.reduce((best, k) => f[k].includes(w) ? Math.max(best, weights[k]) : best, 0);
 
   let best = hit(term.word);
+  // plain words also get a bm25 bonus so the best entries in a subgroup float up
+  if (best && !term.field && !term.phrase) best += bm25(term.word, f);
   if (!best && !term.phrase) {
     for (const s of synonymOf.get(term.word) || []) best = Math.max(best, hit(s) * 0.7);
   }
@@ -377,7 +461,7 @@ function suggest(groups) {
   const fixes = [];
   for (const g of groups) {
     for (const t of g) {
-      if (t.not || t.scale || t.span || t.phrase || t.field) continue;
+      if (t.not || t.scale || t.num || t.phrase || t.field) continue;
       if (vocab.some(w => w.includes(t.word)) || synonymOf.has(t.word)) continue;
       let best = null, bestD = 3;
       for (const w of vocab) {
@@ -431,7 +515,8 @@ const sorters = {
   speed: byScale("speed"),
   // entries with no span or era go last
   span: (a, b) => (a.span ? midSpan(a.span) : Infinity) - (b.span ? midSpan(b.span) : Infinity) || byName(a, b),
-  era: (a, b) => (a.era ? eras.indexOf(a.era) : eras.length) - (b.era ? eras.indexOf(b.era) : eras.length) || byName(a, b)
+  era: (a, b) => (a.era ? eras.indexOf(a.era) : eras.length) - (b.era ? eras.indexOf(b.era) : eras.length) || byName(a, b),
+  re: (a, b) => (a.re ?? Infinity) - (b.re ?? Infinity) || byName(a, b)
 };
 
 // ---------- html helpers ----------
@@ -452,6 +537,7 @@ fill("group", tally(e => [e.group]));
 fill("flight", tally(e => [e.flight]));
 fill("tag", tally(e => e.allTags), t => t in tagParents ? t + " (all)" : t);
 for (const k of ["size", "speed", "span", "era"]) form.elements.sort.add(new Option("by " + k, k));
+form.elements.sort.add(new Option("by flow (reynolds)", "re"));
 
 const out = document.getElementById("out");
 const count = document.getElementById("count");
@@ -522,6 +608,39 @@ function eraNote(e) {
   return `${esc(e.era)} (${around}). ${peers} other wings from this time.`;
 }
 
+// big numbers written short, like 1.2k or 3.4m
+function fmtNum(n) {
+  if (n >= 1e6) return +(n / 1e6).toPrecision(2) + "m";
+  if (n >= 1e3) return +(n / 1e3).toPrecision(2) + "k";
+  return +n.toPrecision(2) + "";
+}
+
+// flow line: the number, its band, and which other wings sit nearest on a log scale
+function flowNote(e) {
+  if (e.re === null) return "unknown (needs a span and a speed above still)";
+  const band = bandOf(e.re);
+  const near = all
+    .filter(x => x.re !== null && x.id !== e.id)
+    .map(x => ({ x, d: Math.abs(Math.log10(x.re) - Math.log10(e.re)) }))
+    .sort((a, b) => a.d - b.d)
+    .slice(0, 3)
+    .map(({ x }) => link(x));
+  return `about ${fmtNum(e.re)} in ${esc(e.fluid)} (${esc(band.name)}): ${esc(band.note)} closest: ${near.join(", ")}.`;
+}
+
+// draw a parts tree as nested lists
+function drawParts(tree) {
+  return `<ul>${tree.map(n => Array.isArray(n)
+    ? `<li>${esc(n[0])}${drawParts(n[1])}</li>`
+    : `<li>${esc(n)}</li>`).join("")}</ul>`;
+}
+
+// other wings that share an environment, counted per environment
+function envNote(e) {
+  if (!e.env.length) return "unknown";
+  return e.env.map(env => `${esc(env)} (${environments[env].length - 1} others)`).join(", ");
+}
+
 // detail view for one entry, opened by #id in the url
 function drawDetail(e) {
   const m = materials[e.material];
@@ -546,8 +665,12 @@ function drawDetail(e) {
 <dt>span</dt><dd>${spanNote(e)}</dd>
 <dt>first seen</dt><dd>${eraNote(e)}</dd>
 <dt>tags</dt><dd>${esc(e.tags.join(", "))}${parents.length ? ` (also counts as: ${esc(parents.join(", "))})` : ""}</dd>
+<dt>found in</dt><dd>${envNote(e)}</dd>
+<dt>flow</dt><dd>${flowNote(e)}</dd>
 <dt>link cluster</dt><dd>${clusterOf.has(e.id) ? `connected to ${clusterSize(e.id) - 1} other wings` : "not linked to any wing"}</dd>
 </dl>
+${e.parts.length ? `<h3>parts</h3>\n${drawParts(e.parts)}` : ""}
+${e.pros.length || e.cons.length ? `<h3>good and bad</h3>\n<ul>${e.pros.map(p => `<li>+ ${esc(p)}</li>`).join("")}${e.cons.map(c => `<li>- ${esc(c)}</li>`).join("")}</ul>` : ""}
 ${e.facts.length ? `<h3>facts</h3>\n<ul>${e.facts.map(f => `<li>${gloss(f)}</li>`).join("")}</ul>` : ""}
 <h3>links</h3>
 <ul>${direct.map(l => `<li>${esc(l.type)} ${link(byId.get(l.to))}</li>`).join("") || "<li>none</li>"}</ul>
@@ -569,6 +692,11 @@ function drawCompare(a, b) {
     ["aspect", e => esc(e.aspect)],
     ["span", e => e.span ? fmtSpan(e.span) : "unknown"],
     ["first seen", e => esc(e.era || "unknown")],
+    ["found in", e => esc(e.env.join(", ") || "unknown")],
+    ["flow", e => e.re === null ? "unknown" : `${fmtNum(e.re)} (${esc(e.flow)})`],
+    ["good", e => esc(e.pros.join(", ") || "none listed")],
+    ["bad", e => esc(e.cons.join(", ") || "none listed")],
+    ["parts", e => esc(e.partNames.join(", ") || "none listed")],
     ["tags", e => esc(e.tags.join(", "))]
   ];
   // how many times wider one is than the other
@@ -585,6 +713,8 @@ ${rows.map(([h, f]) => `<tr><th>${h}</th><td>${f(a)}</td><td>${f(b)}</td></tr>`)
 </table>
 <p>shared tags: ${esc(shared.join(", ") || "none")}</p>
 <p>width: ${esc(spanRatio)}</p>
+<p>shared parts: ${esc(a.partNames.filter(p => b.partNames.includes(p)).join(", ") || "none")}</p>
+<p>shared places: ${esc(a.env.filter(p => b.env.includes(p)).join(", ") || "none")}</p>
 <p>similarity: ${Math.round(cosine(a.id, b.id) * 100)}%</p>
 <p>link path: ${hop ? hop.path.map(id => link(byId.get(id))).join(" &rarr; ") : "none"}</p>`;
 }
