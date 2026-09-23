@@ -10,6 +10,17 @@ const all = wings.flatMap(g =>
 );
 const byId = new Map(all.map(e => [e.id, e]));
 
+// add missing tags, measurements, and eras from facts.js
+for (const e of all) {
+  for (const t of tagPatches[e.id] || []) if (!e.tags.includes(t)) e.tags = [...e.tags, t];
+  if (spans[e.id]) e.span = spans[e.id];
+  if (eraOf[e.id]) e.era = eraOf[e.id];
+  e.facts = facts[e.id] || [];
+}
+// eras act like one more ordered scale, but not every entry has one
+scales.era = eras;
+const optional = new Set(["era"]);
+
 // work out size, speed, and aspect for each entry. first matching rule wins, then overrides
 for (const e of all) {
   for (const rule of traitRules) {
@@ -55,8 +66,13 @@ for (const set of synonyms) for (const w of set) synonymOf.set(w, set.filter(x =
     if (!(e.flight in flightModes)) warn("unknown flight mode", e.id, e.flight);
     if (!(e.material in materials)) warn("unknown material", e.id, e.material);
     for (const [k, list] of Object.entries(scales)) {
+      if (e[k] === undefined && optional.has(k)) continue;
       if (!list.includes(e[k])) warn("bad scale value", e.id, k, e[k]);
     }
+    if (e.span && !(e.span[0] > 0 && e.span[0] <= e.span[1])) warn("bad span", e.id, e.span);
+  }
+  for (const [name, table] of [["span", spans], ["era", eraOf], ["facts", facts], ["tag patch", tagPatches]]) {
+    for (const id in table) if (!byId.has(id)) warn(name + " for missing id", id);
   }
   for (const [a, , b] of links) if (!byId.has(a) || !byId.has(b)) warn("broken link", a, b);
   for (const id in traitOverrides) if (!byId.has(id)) warn("override for missing id", id);
@@ -85,10 +101,43 @@ const fields = {
   size: e => e.size,
   speed: e => e.speed,
   aspect: e => e.aspect,
+  era: e => e.era || "",
+  fact: e => e.facts.join(" "),
   id: e => e.id
 };
 // how much a hit in each field counts toward the score
-const weights = { name: 5, id: 4, tag: 3, example: 3, group: 2, flight: 2, material: 2, size: 1, speed: 1, aspect: 1, note: 1 };
+const weights = { name: 5, id: 4, tag: 3, example: 3, group: 2, flight: 2, material: 2, size: 1, speed: 1, aspect: 1, era: 1, note: 1, fact: 0.5 };
+
+// ---------- measurements ----------
+
+// meters in each unit the search understands
+const units = { mm: 0.001, cm: 0.01, m: 1, km: 1000 };
+
+// read "10", "10m", or "2.5cm" as meters. returns null if it is not a length
+function toMeters(text) {
+  const m = /^(\d+(?:\.\d+)?)(mm|cm|m|km)?$/.exec(text);
+  return m ? parseFloat(m[1]) * units[m[2] || "m"] : null;
+}
+
+// show a length in the unit that reads best
+function fmtLen(m) {
+  const [u, f] = m >= 1000 ? ["km", 1000] : m >= 1 ? ["m", 1] : m >= 0.01 ? ["cm", 0.01] : ["mm", 0.001];
+  return +(m / f).toPrecision(3) + " " + u;
+}
+const fmtSpan = s => s[0] === s[1] ? fmtLen(s[0]) : `${fmtLen(s[0])} to ${fmtLen(s[1])}`;
+
+// the middle of a range on a log scale, since spans run from bristles to buildings
+const midSpan = s => Math.sqrt(s[0] * s[1]);
+
+// median of a list of numbers
+function median(list) {
+  const s = [...list].sort((a, b) => a - b);
+  const h = s.length >> 1;
+  return s.length % 2 ? s[h] : (s[h - 1] + s[h]) / 2;
+}
+
+// 1 -> "1st", 2 -> "2nd", 13 -> "13th"
+const ordinal = n => n + (n % 100 >= 11 && n % 100 <= 13 ? "th" : ["th", "st", "nd", "rd"][n % 10] || "th");
 
 const tokenize = s => s.toLowerCase().split(/[^a-z0-9-]+/).filter(Boolean);
 
@@ -241,7 +290,9 @@ function parse(text) {
       const [, not, key, op, phrase, bare] = m;
       const word = phrase || bare || "";
       if (!word) continue;
-      if (key && op !== ":" && key in scales) {
+      if (key === "span" && op !== ":" && toMeters(word) !== null) {
+        terms.push({ not: !!not, span: true, op, value: toMeters(word) });
+      } else if (key && op !== ":" && key in scales) {
         terms.push({ not: !!not, scale: key, op, value: word.replace(/-/g, " ") });
       } else if (key && key in fields) {
         terms.push({ not: !!not, field: key, word, phrase: !!phrase });
@@ -258,6 +309,13 @@ const compare = { ">": (a, b) => a > b, "<": (a, b) => a < b, ">=": (a, b) => a 
 
 // score one term against one entry. exact hits beat synonyms, synonyms beat typos. 0 means no match
 function termScore(term, e, f) {
+  // span compares check if any part of the entry's range fits
+  if (term.span) {
+    if (!e.span) return 0;
+    const [lo, hi] = e.span, v = term.value;
+    const ok = { ">": hi > v, ">=": hi >= v, "<": lo < v, "<=": lo <= v, "=": lo <= v && v <= hi }[term.op];
+    return ok ? 1 : 0;
+  }
   if (term.scale) {
     const list = scales[term.scale];
     const want = list.indexOf(term.value);
@@ -311,6 +369,27 @@ function candidates(groups) {
   return set;
 }
 
+// every plain word in the db, for "did you mean" hints
+const vocab = [...postings.keys()].filter(w => w.length > 2 && !/\d/.test(w));
+
+// for each plain word that matches nothing, find the closest real word
+function suggest(groups) {
+  const fixes = [];
+  for (const g of groups) {
+    for (const t of g) {
+      if (t.not || t.scale || t.span || t.phrase || t.field) continue;
+      if (vocab.some(w => w.includes(t.word)) || synonymOf.has(t.word)) continue;
+      let best = null, bestD = 3;
+      for (const w of vocab) {
+        const d = distance(t.word, w, 2);
+        if (d < bestD || (d === bestD && best && postings.get(w).size > postings.get(best).size)) { best = w; bestD = d; }
+      }
+      if (best) fixes.push([t.word, best]);
+    }
+  }
+  return fixes;
+}
+
 // ---------- form state ----------
 
 const form = document.getElementById("filters");
@@ -349,7 +428,10 @@ const sorters = {
   material: (a, b) => a.material.localeCompare(b.material) || byName(a, b),
   tags: (a, b) => b.tags.length - a.tags.length || byName(a, b),
   size: byScale("size"),
-  speed: byScale("speed")
+  speed: byScale("speed"),
+  // entries with no span or era go last
+  span: (a, b) => (a.span ? midSpan(a.span) : Infinity) - (b.span ? midSpan(b.span) : Infinity) || byName(a, b),
+  era: (a, b) => (a.era ? eras.indexOf(a.era) : eras.length) - (b.era ? eras.indexOf(b.era) : eras.length) || byName(a, b)
 };
 
 // ---------- html helpers ----------
@@ -369,7 +451,7 @@ function fill(name, pairs, label = v => v) {
 fill("group", tally(e => [e.group]));
 fill("flight", tally(e => [e.flight]));
 fill("tag", tally(e => e.allTags), t => t in tagParents ? t + " (all)" : t);
-for (const k of ["size", "speed"]) form.elements.sort.add(new Option("by " + k, k));
+for (const k of ["size", "speed", "span", "era"]) form.elements.sort.add(new Option("by " + k, k));
 
 const out = document.getElementById("out");
 const count = document.getElementById("count");
@@ -405,6 +487,8 @@ function drawTable(rows) {
     ["size", e => esc(e.size)],
     ["speed", e => esc(e.speed)],
     ["aspect", e => esc(e.aspect)],
+    ["span", e => e.span ? fmtSpan(e.span) : ""],
+    ["era", e => esc(e.era || "")],
     ["tags", e => esc(e.tags.join(", "))]
   ];
   return `<table border="1" cellpadding="4"><tr>${cols.map(([h]) => `<th>${h}</th>`).join("")}</tr>` +
@@ -416,6 +500,26 @@ function drawTable(rows) {
 function scaleNote(e, k) {
   const same = all.filter(x => x[k] === e[k]).length;
   return `${esc(e[k])} (${same} wings share this)`;
+}
+
+// span line with rank inside the group and compared to the group median
+function spanNote(e) {
+  if (!e.span) return "unknown";
+  const peers = all.filter(x => x.group === e.group && x.span);
+  const rank = [...peers].sort((a, b) => b.span[1] - a.span[1]).indexOf(e) + 1;
+  const med = median(peers.map(x => midSpan(x.span)));
+  const ratio = midSpan(e.span) / med;
+  const vs = ratio > 1.5 ? `about ${Math.round(ratio)}x the group middle` : ratio < 0.67 ? `about 1/${Math.round(1 / ratio)} of the group middle` : "near the group middle";
+  return `${fmtSpan(e.span)}. ${ordinal(rank)} widest of ${peers.length} in ${esc(e.group)}, ${vs} (${fmtLen(med)}).`;
+}
+
+// era line with the entries that came just before and after
+function eraNote(e) {
+  if (!e.era) return "unknown";
+  const i = eras.indexOf(e.era);
+  const peers = all.filter(x => x.era === e.era).length - 1;
+  const around = [eras[i - 1] && "after " + eras[i - 1], eras[i + 1] && "before " + eras[i + 1]].filter(Boolean).join(", ");
+  return `${esc(e.era)} (${around}). ${peers} other wings from this time.`;
 }
 
 // detail view for one entry, opened by #id in the url
@@ -439,9 +543,12 @@ function drawDetail(e) {
 <dt>size</dt><dd>${scaleNote(e, "size")}</dd>
 <dt>speed</dt><dd>${scaleNote(e, "speed")}</dd>
 <dt>aspect</dt><dd>${scaleNote(e, "aspect")}</dd>
+<dt>span</dt><dd>${spanNote(e)}</dd>
+<dt>first seen</dt><dd>${eraNote(e)}</dd>
 <dt>tags</dt><dd>${esc(e.tags.join(", "))}${parents.length ? ` (also counts as: ${esc(parents.join(", "))})` : ""}</dd>
 <dt>link cluster</dt><dd>${clusterOf.has(e.id) ? `connected to ${clusterSize(e.id) - 1} other wings` : "not linked to any wing"}</dd>
 </dl>
+${e.facts.length ? `<h3>facts</h3>\n<ul>${e.facts.map(f => `<li>${gloss(f)}</li>`).join("")}</ul>` : ""}
 <h3>links</h3>
 <ul>${direct.map(l => `<li>${esc(l.type)} ${link(byId.get(l.to))}</li>`).join("") || "<li>none</li>"}</ul>
 <h3>further links</h3>
@@ -460,8 +567,14 @@ function drawCompare(a, b) {
     ["size", e => esc(e.size)],
     ["speed", e => esc(e.speed)],
     ["aspect", e => esc(e.aspect)],
+    ["span", e => e.span ? fmtSpan(e.span) : "unknown"],
+    ["first seen", e => esc(e.era || "unknown")],
     ["tags", e => esc(e.tags.join(", "))]
   ];
+  // how many times wider one is than the other
+  const spanRatio = a.span && b.span
+    ? (r => r > 0.8 && r < 1.25 ? "about the same width" : r >= 1 ? `${a.name} is about ${+r.toPrecision(2)}x as wide` : `${b.name} is about ${+(1 / r).toPrecision(2)}x as wide`)(midSpan(a.span) / midSpan(b.span))
+    : "unknown";
   const shared = a.tags.filter(t => b.tags.includes(t));
   const hop = walk(a.id, 6).get(b.id);
   return `<p><a href="#${a.id}">back</a></p>
@@ -471,6 +584,7 @@ function drawCompare(a, b) {
 ${rows.map(([h, f]) => `<tr><th>${h}</th><td>${f(a)}</td><td>${f(b)}</td></tr>`).join("\n")}
 </table>
 <p>shared tags: ${esc(shared.join(", ") || "none")}</p>
+<p>width: ${esc(spanRatio)}</p>
 <p>similarity: ${Math.round(cosine(a.id, b.id) * 100)}%</p>
 <p>link path: ${hop ? hop.path.map(id => link(byId.get(id))).join(" &rarr; ") : "none"}</p>`;
 }
@@ -498,7 +612,9 @@ function draw() {
   if (sorted) rows.sort((a, b) => sorters[s.sort](a.e, b.e));
   else if (s.view === "table" && s.groups.length) rows.sort((a, b) => b.score - a.score);
 
-  count.textContent = `${rows.length} of ${all.length} wings`;
+  const hint = rows.length ? [] : suggest(s.groups);
+  count.textContent = `${rows.length} of ${all.length} wings` +
+    (hint.length ? `. did you mean: ${hint.map(([, to]) => to).join(", ")}?` : "");
   out.innerHTML = !rows.length ? "<p>no wings found.</p>"
     : s.view === "table" || sorted ? drawTable(rows)
     : drawList(rows);
