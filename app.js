@@ -70,6 +70,59 @@ for (const e of all) {
   e.flow = e.re === null ? null : bandOf(e.re).name;
 }
 
+// ---------- rough aerodynamics ----------
+
+// numbers used below. drag at zero lift (cd0) and span efficiency are rough guesses per kind of material
+const gravity = 9.81;
+const zeroLiftDrag = { made: 0.015, natural: 0.03, mixed: 0.025 };
+const spanEfficiency = 0.8;
+const flies = new Set(["powered", "flapping", "gliding", "swimming"]);
+
+// wing area from middle span and aspect ratio: span squared over aspect
+const wingArea = e => e.span ? Math.sqrt(e.span[0] * e.span[1]) ** 2 / aspectRatio[e.aspect] : null;
+
+// work out mass, area, wing loading, slowest flying speed, and best glide for each entry that has the numbers
+for (const e of all) {
+  const origin = materials[e.material]?.origin || "made";
+  e.mass = masses[e.id] ?? null;
+  e.area = wingArea(e);
+  e.loading = e.mass !== null && e.area ? e.mass / e.area : null;
+  // lift = half * density * speed squared * area * lift coefficient, solved for speed at the best coefficient
+  e.stall = e.loading !== null && flies.has(e.flight)
+    ? Math.sqrt(2 * e.loading * gravity / (densities[e.fluid] * maxLift[origin]))
+    : null;
+  // best lift over drag for a simple wing: half the root of (pi * efficiency * aspect / cd0)
+  // spinning blades and spun toys do not glide in a straight line, so they get no glide number
+  const spins = e.tags.includes("spin") || wakes["helical wake"].ids.includes(e.id);
+  // below a reynolds number of about a thousand, thickness wins and this formula means nothing. myths get none either
+  const sticky = e.re !== null && e.re < 1e3;
+  e.glide = flies.has(e.flight) && e.fluid !== "water" && !spins && !sticky && !tagParents["not real"].some(t => e.tags.includes(t))
+    ? 0.5 * Math.sqrt(Math.PI * spanEfficiency * aspectRatio[e.aspect] / zeroLiftDrag[origin])
+    : null;
+  e.airfoil = airfoilOf[e.id] || null;
+  e.wake = Object.keys(wakes).find(w => wakes[w].ids.includes(e.id)) || null;
+}
+
+// least squares line through points, returning slope, intercept, and how well it fits (r squared)
+function fitLine(points) {
+  const n = points.length;
+  if (n < 2) return null;
+  const mx = points.reduce((t, p) => t + p[0], 0) / n;
+  const my = points.reduce((t, p) => t + p[1], 0) / n;
+  let sxy = 0, sxx = 0, syy = 0;
+  for (const [x, y] of points) { sxy += (x - mx) * (y - my); sxx += (x - mx) ** 2; syy += (y - my) ** 2; }
+  const slope = sxy / sxx;
+  return { slope, intercept: my - slope * mx, r2: sxy * sxy / (sxx * syy), n };
+}
+
+// how wing loading grows with mass on a log-log plot. a perfectly scaled up copy gives a slope of one third
+const logPoints = list => list.filter(e => e.loading && e.mass).map(e => [Math.log10(e.mass), Math.log10(e.loading)]);
+const scaling = fitLine(logPoints(all));
+const scalingOf = origin => fitLine(logPoints(all.filter(e => materials[e.material]?.origin === origin)));
+
+// a wing's loading next to what the fitted line expects for its mass. above one means heavier on its wings than usual
+const loadingVsLine = e => e.loading && scaling ? e.loading / 10 ** (scaling.intercept + scaling.slope * Math.log10(e.mass)) : null;
+
 // tag -> every parent tag above it, so filters on a parent also catch children
 const parentsOf = new Map();
 for (const [parent, kids] of Object.entries(tagParents)) {
@@ -152,6 +205,27 @@ for (const set of synonyms) for (const w of set) synonymOf.set(w, set.filter(x =
   }
   for (const [a, , b] of links) if (!byId.has(a) || !byId.has(b)) warn("broken link", a, b);
   for (const id in traitOverrides) if (!byId.has(id)) warn("override for missing id", id);
+  for (const [id, m] of Object.entries(masses)) {
+    if (!byId.has(id)) warn("mass for missing id", id);
+    else if (!(m > 0)) warn("bad mass", id, m);
+    else if (!byId.get(id).span) warn("mass but no span, so no loading", id);
+  }
+  for (const [id, a] of Object.entries(airfoilOf)) {
+    if (!byId.has(id)) warn("airfoil for missing id", id);
+    if (!(a in airfoils)) warn("unknown airfoil", id, a);
+  }
+  const waked = new Map();
+  for (const [w, { ids }] of Object.entries(wakes)) for (const id of ids) {
+    if (!byId.has(id)) warn("wake " + w + " for missing id", id);
+    if (waked.has(id)) warn("two wakes for", id, waked.get(id), w);
+    waked.set(id, w);
+  }
+  for (const f in fluids) if (!(f in densities)) warn("no density for fluid", f);
+  // physics sanity checks: numbers this far out mean a mass or span is off
+  for (const e of all) {
+    if (e.stall !== null && e.fluid === "air" && e.stall > 150) warn("stall speed looks too high", e.id, Math.round(e.stall));
+    if (e.loading !== null && e.loading > 2000) warn("wing loading looks too high", e.id, Math.round(e.loading));
+  }
 })();
 
 // ---------- counts ----------
@@ -185,11 +259,13 @@ const fields = {
   con: e => e.cons.join(" "),
   source: e => e.cites.map(c => c.publisher + " " + c.title).join(" ") + " " + e.strength,
   flow: e => e.flow || "",
+  airfoil: e => e.airfoil || "",
+  wake: e => e.wake || "",
   fluid: e => e.fluid,
   id: e => e.id
 };
 // how much a hit in each field counts toward the score
-const weights = { name: 5, id: 4, tag: 3, example: 3, env: 2, part: 2, group: 2, flight: 2, material: 2, flow: 1, fluid: 1, size: 1, speed: 1, aspect: 1, era: 1, note: 1, pro: 1, con: 1, fact: 0.5, source: 0.5 };
+const weights = { name: 5, id: 4, tag: 3, example: 3, env: 2, part: 2, group: 2, flight: 2, material: 2, flow: 1, fluid: 1, size: 1, speed: 1, aspect: 1, era: 1, note: 1, pro: 1, con: 1, fact: 0.5, source: 0.5, airfoil: 1, wake: 1 };
 
 // ---------- measurements ----------
 
@@ -269,9 +345,13 @@ const reverse = {
   "same idea": "same idea",
   "evolved like": "evolved like",
   "part of": "has part",
-  "replaced": "was replaced by"
+  "replaced": "was replaced by",
+  "led to": "came from",
+  "type of": "has kind",
+  "belongs to": "owns"
 };
 
+for (const [a, type, b] of links) if (!(type in reverse)) console.warn("wing db: link type with no reverse", type, a, b);
 const graph = new Map(all.map(e => [e.id, []]));
 for (const [a, type, b] of links) {
   if (!graph.has(a) || !graph.has(b)) continue;
@@ -392,7 +472,11 @@ function toNumber(text) {
 // fields that hold numbers or number ranges, and how to read a typed value for each
 const numeric = {
   span: { get: e => e.span, read: toMeters },
-  re: { get: e => e.re === null ? null : [e.re, e.re], read: toNumber }
+  re: { get: e => e.re === null ? null : [e.re, e.re], read: toNumber },
+  mass: { get: e => e.mass === null ? null : [e.mass, e.mass], read: toNumber },
+  load: { get: e => e.loading === null ? null : [e.loading, e.loading], read: toNumber },
+  stall: { get: e => e.stall === null ? null : [e.stall, e.stall], read: toNumber },
+  glide: { get: e => e.glide === null ? null : [e.glide, e.glide], read: toNumber }
 };
 
 // turn the search box into groups of terms. groups are split by | and mean "or".
@@ -551,7 +635,9 @@ const sorters = {
   // entries with no span or era go last
   span: (a, b) => (a.span ? midSpan(a.span) : Infinity) - (b.span ? midSpan(b.span) : Infinity) || byName(a, b),
   era: (a, b) => (a.era ? eras.indexOf(a.era) : eras.length) - (b.era ? eras.indexOf(b.era) : eras.length) || byName(a, b),
-  re: (a, b) => (a.re ?? Infinity) - (b.re ?? Infinity) || byName(a, b)
+  re: (a, b) => (a.re ?? Infinity) - (b.re ?? Infinity) || byName(a, b),
+  loading: (a, b) => (a.loading ?? Infinity) - (b.loading ?? Infinity) || byName(a, b),
+  stall: (a, b) => (a.stall ?? Infinity) - (b.stall ?? Infinity) || byName(a, b)
 };
 
 // ---------- html helpers ----------
@@ -573,6 +659,8 @@ fill("flight", tally(e => [e.flight]));
 fill("tag", tally(e => e.allTags), t => t in tagParents ? t + " (all)" : t);
 for (const k of ["size", "speed", "span", "era"]) form.elements.sort.add(new Option("by " + k, k));
 form.elements.sort.add(new Option("by flow (reynolds)", "re"));
+form.elements.sort.add(new Option("by wing loading", "loading"));
+form.elements.sort.add(new Option("by slowest speed", "stall"));
 
 const out = document.getElementById("out");
 const count = document.getElementById("count");
@@ -609,6 +697,7 @@ function drawTable(rows) {
     ["speed", e => esc(e.speed)],
     ["aspect", e => esc(e.aspect)],
     ["span", e => e.span ? fmtSpan(e.span) : ""],
+    ["loading", e => e.loading === null ? "" : fmtNum(e.loading) + " kg/m²"],
     ["era", e => esc(e.era || "")],
     ["tags", e => esc(e.tags.join(", "))]
   ];
@@ -702,7 +791,12 @@ function drawDetail(e) {
 <dt>tags</dt><dd>${esc(e.tags.join(", "))}${parents.length ? ` (also counts as: ${esc(parents.join(", "))})` : ""}</dd>
 <dt>found in</dt><dd>${envNote(e)}</dd>
 <dt>flow</dt><dd>${flowNote(e)}</dd>
-<dt>link cluster</dt><dd>${clusterOf.has(e.id) ? `connected to ${clusterSize(e.id) - 1} other wings` : "not linked to any wing"}</dd>
+<dt>weight</dt><dd>${loadNote(e)}</dd>
+<dt>slowest flight</dt><dd>${e.stall === null ? "unknown" : `about ${fmtSpeed(e.stall)} (rough, from loading and the best lift before a stall)`}</dd>
+<dt>best glide</dt><dd>${e.glide === null ? "not worked out" : `about ${Math.round(e.glide)} forward for every 1 down (rough, from aspect alone)`}</dd>
+<dt>section</dt><dd>${e.airfoil ? `${esc(e.airfoil)}: ${esc(airfoils[e.airfoil].note)} <a href="#aero">all sections</a>` : "unknown"}</dd>
+<dt>wake</dt><dd>${e.wake ? `${esc(e.wake)}: ${esc(wakes[e.wake].note)}` : "unknown"}</dd>
+<dt>link cluster</dt><dd>${clusterOf.has(e.id) ? `connected to ${clusterSize(e.id) - 1} other ${clusterSize(e.id) === 2 ? "wing" : "wings"}` : "not linked to any wing"}</dd>
 <dt>sourcing</dt><dd>${e.strength} (${e.cites.length} ${e.cites.length === 1 ? "source" : "sources"})</dd>
 </dl>
 ${e.parts.length ? `<h3>parts</h3>\n${drawParts(e.parts)}` : ""}
@@ -732,6 +826,12 @@ function drawCompare(a, b) {
     ["first seen", e => esc(e.era || "unknown")],
     ["found in", e => esc(e.env.join(", ") || "unknown")],
     ["flow", e => e.re === null ? "unknown" : `${fmtNum(e.re)} (${esc(e.flow)})`],
+    ["mass", e => e.mass === null ? "unknown" : fmtMass(e.mass)],
+    ["loading", e => e.loading === null ? "unknown" : fmtNum(e.loading) + " kg/m²"],
+    ["slowest", e => e.stall === null ? "unknown" : fmtSpeed(e.stall)],
+    ["best glide", e => e.glide === null ? "unknown" : Math.round(e.glide) + " to 1"],
+    ["section", e => esc(e.airfoil || "unknown")],
+    ["wake", e => esc(e.wake || "unknown")],
     ["good", e => esc(e.pros.join(", ") || "none listed")],
     ["bad", e => esc(e.cons.join(", ") || "none listed")],
     ["parts", e => esc(e.partNames.join(", ") || "none listed")],
@@ -807,11 +907,199 @@ ${missing.length ? `<dt>missing</dt><dd>${missing.map(link).join(", ")}</dd>` : 
 ${unused.length ? `<p>not used anywhere: ${esc(unused.join(", "))}</p>` : ""}`;
 }
 
+// mass in milligrams, grams, kilograms, or tonnes
+function fmtMass(kg) {
+  if (kg >= 1000) return +(kg / 1000).toPrecision(2) + " t";
+  if (kg >= 1) return +kg.toPrecision(2) + " kg";
+  if (kg >= 0.001) return +(kg * 1000).toPrecision(2) + " g";
+  return +(kg * 1e6).toPrecision(2) + " mg";
+}
+// area in square meters, or square centimeters or millimeters when small
+const fmtArea = a => a >= 0.01 ? +a.toPrecision(2) + " m²" : a >= 1e-4 ? +(a * 1e4).toPrecision(2) + " cm²" : +(a * 1e6).toPrecision(2) + " mm²";
+// speed in meters per second, with km/h beside it
+const fmtSpeed = ms => `${+ms.toPrecision(2)} m/s (${Math.round(ms * 3.6)} km/h)`;
+
+// weight line: mass, area, loading, and how that sits against the fitted line
+function loadNote(e) {
+  if (e.mass === null) return "unknown";
+  if (e.loading === null) return fmtMass(e.mass) + ", no span to work out loading";
+  const vs = loadingVsLine(e);
+  const word = vs > 2 ? "much heavier on its wings than" : vs > 1.25 ? "heavier on its wings than" : vs < 0.5 ? "much lighter on its wings than" : vs < 0.8 ? "lighter on its wings than" : "about as loaded as";
+  return `${fmtMass(e.mass)} on about ${fmtArea(e.area)} of wing: ${fmtNum(e.loading)} kg/m², ${word} the line through all wings predicts for its mass (<a href="#stats">stats</a>).`;
+}
+
+// a text bar, for charts drawn only with characters
+const bar = (n, max, width = 30) => "#".repeat(Math.max(1, Math.round(n / max * width)));
+const chart = pairs => {
+  const max = Math.max(...pairs.map(p => p[1]));
+  return `<pre>${pairs.map(([k, n]) => `${esc(String(k).padEnd(28))} ${bar(n, max)} ${n}`).join("\n")}</pre>`;
+};
+
+// top or bottom few entries by a number, skipping ones without it
+function ranked(get, fmt, dir = -1, n = 5) {
+  return all.filter(e => get(e) !== null && get(e) !== undefined)
+    .sort((a, b) => dir * (get(a) - get(b)) || byName(a, b))
+    .slice(0, n)
+    .map(e => `${link(e)} (${fmt(get(e))})`).join(", ");
+}
+
+// the stats page: counts, extremes, and the scaling line
+function drawStats() {
+  const spanMid = e => e.span ? midSpan(e.span) : null;
+  const line = f => f ? `slope ${f.slope.toFixed(2)} from ${f.n} wings, fit ${Math.round(f.r2 * 100)}%` : "not enough wings";
+  const byOrigin = ["natural", "made", "mixed"].map(o => `<li>${o}: ${line(scalingOf(o))}</li>`).join("");
+  const off = all.filter(e => loadingVsLine(e) !== null).sort((a, b) => loadingVsLine(b) - loadingVsLine(a));
+  return `<p><a href="#">back</a></p>
+<h2>stats</h2>
+<h3>by group</h3>
+${chart(tally(e => [e.group]))}
+<h3>by flight</h3>
+${chart(tally(e => [e.flight]))}
+<h3>by material origin</h3>
+${chart(tally(e => [materials[e.material]?.origin || "unknown"]))}
+<h3>by flow band</h3>
+${chart(tally(e => [e.flow || "unknown"]))}
+<h3>by wake</h3>
+${chart(tally(e => [e.wake || "unknown"]))}
+<h3>extremes</h3>
+<ul>
+<li>widest: ${ranked(spanMid, fmtLen)}</li>
+<li>narrowest: ${ranked(spanMid, fmtLen, 1)}</li>
+<li>heaviest: ${ranked(e => e.mass, fmtMass)}</li>
+<li>lightest: ${ranked(e => e.mass, fmtMass, 1)}</li>
+<li>most weight per area: ${ranked(e => e.loading, n => fmtNum(n) + " kg/m²")}</li>
+<li>least weight per area: ${ranked(e => e.loading, n => fmtNum(n) + " kg/m²", 1)}</li>
+<li>fastest slowest speed: ${ranked(e => e.stall, fmtSpeed)}</li>
+<li>slowest flyers: ${ranked(e => e.stall, fmtSpeed, 1)}</li>
+<li>best glide: ${ranked(e => e.glide, n => Math.round(n) + " to 1")}</li>
+<li>most tags: ${ranked(e => e.tags.length, String)}</li>
+<li>most linked: ${ranked(e => graph.get(e.id).length, String)}</li>
+<li>most cited: ${ranked(e => e.cites.length, String)}</li>
+</ul>
+<h3>square-cube scaling</h3>
+<p>if a wing were just scaled up, mass grows with length cubed and area with length squared, so weight per area grows as mass to the power one third (slope 0.33). the line through every wing with a mass:</p>
+<ul><li>all: ${line(scaling)}</li>${byOrigin}</ul>
+<p>furthest above the line: ${off.slice(0, 5).map(e => `${link(e)} (${loadingVsLine(e).toFixed(1)}x)`).join(", ")}</p>
+<p>furthest below the line: ${off.slice(-5).reverse().map(e => `${link(e)} (${loadingVsLine(e).toFixed(2)}x)`).join(", ")}</p>`;
+}
+
+// the eras page: every wing on a timeline of stages
+function drawEras() {
+  const none = all.filter(e => !e.era).sort(byName);
+  return `<p><a href="#">back</a></p>
+<h2>eras</h2>
+${eras.map(era => {
+    const list = all.filter(e => e.era === era).sort(byName);
+    return `<h3>${esc(era)} (${list.length})</h3><p>${list.map(link).join(", ") || "none"}</p>`;
+  }).join("\n")}
+<h3>no era set (${none.length})</h3>
+<p>${none.map(link).join(", ")}</p>`;
+}
+
+// the tree page: groups, subgroups, and entries as nested lists with counts
+function drawTree() {
+  const groups = new Map();
+  for (const e of all) {
+    if (!groups.has(e.group)) groups.set(e.group, new Map());
+    const subs = groups.get(e.group);
+    if (!subs.has(e.subgroup)) subs.set(e.subgroup, []);
+    subs.get(e.subgroup).push(e);
+  }
+  const sizeOf = subs => [...subs.values()].reduce((t, l) => t + l.length, 0);
+  return `<p><a href="#">back</a></p>
+<h2>tree (${all.length} wings, ${groups.size} groups)</h2>
+<ul>${[...groups].map(([g, subs]) => `<li>${esc(g)} (${sizeOf(subs)})<ul>${[...subs].map(([s, list]) =>
+    `<li>${esc(s)} (${list.length})<ul>${list.map(e => `<li>${link(e)}</li>`).join("")}</ul></li>`).join("")}</ul></li>`).join("")}</ul>
+<h3>tag tree</h3>
+<ul>${Object.entries(tagParents).map(([p, kids]) => `<li>${esc(p)}<ul>${kids.map(k => `<li>${esc(k)} (${all.filter(e => e.allTags.has(k)).length})</li>`).join("")}</ul></li>`).join("")}</ul>`;
+}
+
+// the words page: sayings, the word in other languages, and word roots found in names
+function drawWords() {
+  // which entries hold each root in their name, examples, or id
+  const holders = root => all.filter(e => (e.name + " " + e.examples.join(" ") + " " + e.id).includes(root));
+  // languages that share the same word are listed together
+  const same = new Map();
+  for (const [lang, w] of words) same.set(w, [...(same.get(w) || []), lang]);
+  return `<p><a href="#">back</a></p>
+<h2>words</h2>
+<h3>sayings (${sayings.length})</h3>
+<ul>${sayings.map(([s, m]) => `<li>${esc(s)}: ${esc(m)}</li>`).join("")}</ul>
+<h3>wing in other languages (${words.length})</h3>
+<ul>${[...same].map(([w, langs]) => `<li>${esc(w)}: ${esc(langs.join(", "))}</li>`).join("")}</ul>
+<h3>word roots</h3>
+<ul>${Object.entries(roots).map(([r, m]) => {
+    const h = holders(r);
+    return `<li>${esc(r)}: ${esc(m)}${h.length ? ` in this db: ${h.map(link).join(", ")}` : ""}</li>`;
+  }).join("")}</ul>
+<p>sources: ${tableCites["sayings"].map(k => sourceLink(sources[k])).join(", ")}</p>`;
+}
+
+// the aero page: airfoil sections, wakes, and the numbers used for the rough estimates
+function drawAero() {
+  const cited = [...new Set([...tableCites["glide and stall estimates"], ...tableCites["airfoil sections"], ...tableCites["wake shapes"]])];
+  return `<p><a href="#">back</a></p>
+<h2>sections and wakes</h2>
+<h3>airfoil sections</h3>
+<table border="1" cellpadding="4"><tr><th>name</th><th>thickness</th><th>camber</th><th>about</th><th>used by</th></tr>
+${Object.entries(airfoils).map(([n, a]) => `<tr><td>${esc(n)}</td><td>${+(a.thickness * 100).toFixed(1)}%</td><td>${+(a.camber * 100).toFixed(1)}%</td><td>${esc(a.note)}</td><td>${all.filter(e => e.airfoil === n).map(link).join(", ")}</td></tr>`).join("\n")}
+</table>
+<h3>wakes</h3>
+<ul>${Object.entries(wakes).map(([w, v]) => `<li>${esc(w)}: ${esc(v.note)} ${v.ids.map(id => link(byId.get(id))).join(", ")}</li>`).join("")}</ul>
+<h3>numbers behind the estimates</h3>
+<ul>
+<li>gravity: ${gravity} m/s²</li>
+<li>span efficiency: ${spanEfficiency}</li>
+<li>drag at zero lift: ${Object.entries(zeroLiftDrag).map(([k, v]) => `${k} ${v}`).join(", ")}</li>
+<li>best lift before stall: ${Object.entries(maxLift).map(([k, v]) => `${k} ${v}`).join(", ")}</li>
+<li>fluid density: ${Object.entries(densities).map(([k, v]) => `${esc(k)} ${v} kg/m³`).join(", ")}</li>
+<li>aspect ratio per step: ${Object.entries(aspectRatio).map(([k, v]) => `${esc(k)} ${v}`).join(", ")}</li>
+</ul>
+<p>sources: ${cited.map(k => sourceLink(sources[k])).join(", ")}</p>`;
+}
+
+// the graph page: every link cluster, its size, and its most linked wing
+function drawGraph() {
+  const clusters = new Map();
+  for (const [id, c] of clusterOf) clusters.set(c, [...(clusters.get(c) || []), id]);
+  const lonely = all.filter(e => !clusterOf.has(e.id));
+  const sorted = [...clusters.values()].sort((a, b) => b.length - a.length);
+  const hub = ids => ids.reduce((best, id) => graph.get(id).length > graph.get(best).length ? id : best);
+  const typeCount = new Map();
+  for (const [, t] of links) typeCount.set(t, (typeCount.get(t) || 0) + 1);
+  return `<p><a href="#">back</a></p>
+<h2>link graph</h2>
+<p>${links.length} links, ${sorted.length} clusters, ${lonely.length} wings with no links.</p>
+<h3>link types</h3>
+<ul>${[...typeCount].sort((a, b) => b[1] - a[1]).map(([t, n]) => `<li>${esc(t)} / ${esc(reverse[t] || t)}: ${n}</li>`).join("")}</ul>
+<h3>clusters</h3>
+<ol>${sorted.map(ids => `<li>${ids.length} wings, hub ${link(byId.get(hub(ids)))}: ${ids.map(id => link(byId.get(id))).join(", ")}</li>`).join("")}</ol>
+<h3>no links</h3>
+<p>${lonely.map(link).join(", ") || "none"}</p>`;
+}
+
+// pages with a fixed name in the url, instead of a wing id
+const pages = {
+  sources: drawSources,
+  stats: drawStats,
+  eras: drawEras,
+  tree: drawTree,
+  words: drawWords,
+  aero: drawAero,
+  graph: drawGraph
+};
+
 function draw() {
-  if (location.hash === "#sources") {
+  const name = location.hash.slice(1);
+  // #random jumps to any one wing
+  if (name === "random") {
+    location.replace("#" + all[Math.floor(Math.random() * all.length)].id);
+    return;
+  }
+  if (Object.hasOwn(pages, name)) {
     form.hidden = true;
     count.textContent = "";
-    out.innerHTML = drawSources();
+    out.innerHTML = pages[name]();
     return;
   }
   const ids = decodeURIComponent(location.hash.slice(1)).split(",").map(id => byId.get(id));
