@@ -1,6 +1,6 @@
-// flattens the db, builds indexes and a link graph, and draws everything with plain html
+// flattens the db, works out traits, builds indexes and a link graph, and draws everything with plain html
 
-// ---------- flatten and index ----------
+// ---------- flatten and derive ----------
 
 // flatten nested groups into one list, keeping where each entry came from
 const all = wings.flatMap(g =>
@@ -10,28 +10,68 @@ const all = wings.flatMap(g =>
 );
 const byId = new Map(all.map(e => [e.id, e]));
 
+// work out size, speed, and aspect for each entry. first matching rule wins, then overrides
+for (const e of all) {
+  for (const rule of traitRules) {
+    if (!rule.when(e)) continue;
+    for (const [k, v] of Object.entries(rule.set)) if (!(k in e)) e[k] = v;
+  }
+  Object.assign(e, traitOverrides[e.id] || {});
+}
+
+// tag -> every parent tag above it, so filters on a parent also catch children
+const parentsOf = new Map();
+for (const [parent, kids] of Object.entries(tagParents)) {
+  for (const k of kids) {
+    if (!parentsOf.has(k)) parentsOf.set(k, []);
+    parentsOf.get(k).push(parent);
+  }
+}
+function expandTags(tags) {
+  const out = new Set(tags);
+  const stack = [...tags];
+  while (stack.length) {
+    for (const p of parentsOf.get(stack.pop()) || []) {
+      if (!out.has(p)) { out.add(p); stack.push(p); }
+    }
+  }
+  return out;
+}
+for (const e of all) e.allTags = expandTags(e.tags);
+
+// word -> every word that means the same
+const synonymOf = new Map();
+for (const set of synonyms) for (const w of set) synonymOf.set(w, set.filter(x => x !== w));
+
+// ---------- validate ----------
+
 // check the db for mistakes and report them in the console
 (function validate() {
   const seen = new Set();
+  const warn = (...a) => console.warn("wing db:", ...a);
   for (const e of all) {
-    if (seen.has(e.id)) console.warn("duplicate id:", e.id);
+    if (seen.has(e.id)) warn("duplicate id", e.id);
     seen.add(e.id);
-    if (!(e.flight in flightModes)) console.warn("unknown flight mode:", e.id, e.flight);
-    if (!(e.material in materials)) console.warn("unknown material:", e.id, e.material);
+    if (!(e.flight in flightModes)) warn("unknown flight mode", e.id, e.flight);
+    if (!(e.material in materials)) warn("unknown material", e.id, e.material);
+    for (const [k, list] of Object.entries(scales)) {
+      if (!list.includes(e[k])) warn("bad scale value", e.id, k, e[k]);
+    }
   }
-  for (const [a, , b] of links) {
-    if (!byId.has(a) || !byId.has(b)) console.warn("broken link:", a, b);
-  }
+  for (const [a, , b] of links) if (!byId.has(a) || !byId.has(b)) warn("broken link", a, b);
+  for (const id in traitOverrides) if (!byId.has(id)) warn("override for missing id", id);
 })();
 
+// ---------- counts ----------
+
 // collect every value seen for a field, with counts
-function tally(field) {
+function tally(get) {
   const counts = new Map();
-  for (const e of all) {
-    for (const v of [].concat(e[field])) counts.set(v, (counts.get(v) || 0) + 1);
-  }
+  for (const e of all) for (const v of get(e)) counts.set(v, (counts.get(v) || 0) + 1);
   return [...counts].sort((a, b) => a[0].localeCompare(b[0]));
 }
+
+// ---------- search index ----------
 
 // searchable text for each entry, split by field so field:value queries work
 const fields = {
@@ -40,19 +80,33 @@ const fields = {
   group: e => e.group + " " + e.subgroup,
   flight: e => e.flight,
   material: e => e.material,
-  tag: e => e.tags.join(" "),
+  tag: e => [...e.allTags].join(" "),
   example: e => e.examples.join(" "),
+  size: e => e.size,
+  speed: e => e.speed,
+  aspect: e => e.aspect,
   id: e => e.id
 };
 // how much a hit in each field counts toward the score
-const weights = { name: 5, id: 4, tag: 3, example: 3, group: 2, flight: 2, material: 2, note: 1 };
+const weights = { name: 5, id: 4, tag: 3, example: 3, group: 2, flight: 2, material: 2, size: 1, speed: 1, aspect: 1, note: 1 };
+
+const tokenize = s => s.toLowerCase().split(/[^a-z0-9-]+/).filter(Boolean);
 
 const index = new Map(all.map(e => {
   const f = {};
   for (const k in fields) f[k] = fields[k](e).toLowerCase();
-  f.words = new Set(Object.values(f).join(" ").split(/[^a-z0-9-]+/).filter(Boolean));
+  f.words = new Set(tokenize(Object.values(f).join(" ")));
   return [e.id, f];
 }));
+
+// inverted index: word -> ids, used to skip entries that cannot match
+const postings = new Map();
+for (const [id, f] of index) {
+  for (const w of f.words) {
+    if (!postings.has(w)) postings.set(w, new Set());
+    postings.get(w).add(id);
+  }
+}
 
 // ---------- link graph ----------
 
@@ -72,8 +126,11 @@ for (const [a, type, b] of links) {
   graph.get(b).push({ to: a, type: reverse[type] || type });
 }
 
-// breadth-first walk out from one entry, returning distance and path to each reached entry
+// breadth-first walk out from one entry, cached since the graph never changes
+const walkCache = new Map();
 function walk(start, maxDepth = 3) {
+  const key = start + "/" + maxDepth;
+  if (walkCache.has(key)) return walkCache.get(key);
   const found = new Map([[start, { depth: 0, path: [start] }]]);
   let edge = [start];
   for (let d = 1; d <= maxDepth && edge.length; d++) {
@@ -88,41 +145,73 @@ function walk(start, maxDepth = 3) {
     edge = next;
   }
   found.delete(start);
+  walkCache.set(key, found);
   return found;
 }
 
+// split the graph into connected clusters, used for stats in the detail view
+const clusterOf = new Map();
+{
+  let n = 0;
+  for (const e of all) {
+    if (clusterOf.has(e.id) || !graph.get(e.id).length) continue;
+    n++;
+    clusterOf.set(e.id, n);
+    for (const id of walk(e.id, Infinity).keys()) clusterOf.set(id, n);
+  }
+}
+const clusterSize = id => [...clusterOf.values()].filter(c => c === clusterOf.get(id)).length;
+
 // ---------- similarity ----------
 
-// share of tags two entries have in common
-function jaccard(a, b) {
-  const A = new Set(a), B = new Set(b);
-  let both = 0;
-  for (const x of A) if (B.has(x)) both++;
-  return both / (A.size + B.size - both || 1);
+// tf-idf vectors over tags, material, flight, and note words. rare features count more
+const docs = all.map(e => [
+  ...[...e.allTags].map(t => "tag:" + t),
+  "material:" + e.material,
+  "flight:" + e.flight,
+  "size:" + e.size,
+  "speed:" + e.speed,
+  ...tokenize(e.note).filter(w => w.length > 3).map(w => "word:" + w)
+]);
+const docFreq = new Map();
+for (const d of docs) for (const t of new Set(d)) docFreq.set(t, (docFreq.get(t) || 0) + 1);
+
+const vectors = new Map(all.map((e, i) => {
+  const tf = new Map();
+  for (const t of docs[i]) tf.set(t, (tf.get(t) || 0) + 1);
+  const v = new Map();
+  let len = 0;
+  for (const [t, n] of tf) {
+    const w = n * Math.log(all.length / docFreq.get(t));
+    v.set(t, w);
+    len += w * w;
+  }
+  return [e.id, { v, len: Math.sqrt(len) || 1 }];
+}));
+
+function cosine(a, b) {
+  const A = vectors.get(a), B = vectors.get(b);
+  let dot = 0;
+  for (const [t, w] of A.v) if (B.v.has(t)) dot += w * B.v.get(t);
+  return dot / (A.len * B.len);
 }
 
-// related entries score on tags, same subgroup, material, flight, and closeness in the graph
+// related entries mix text similarity with closeness in the link graph
 function related(entry, limit = 6) {
   const near = walk(entry.id, 3);
   return all
     .filter(e => e.id !== entry.id)
     .map(e => {
       const hop = near.get(e.id);
-      const score =
-        jaccard(entry.tags, e.tags) * 4 +
-        (e.subgroup === entry.subgroup ? 1 : 0) +
-        (e.material === entry.material ? 0.5 : 0) +
-        (e.flight === entry.flight ? 0.5 : 0) +
-        (hop ? 3 / hop.depth : 0);
-      return { e, score };
+      return { e, score: cosine(entry.id, e.id) * 5 + (hop ? 2 / hop.depth : 0) };
     })
-    .filter(x => x.score > 1)
+    .filter(x => x.score > 0.8)
     .sort((a, b) => b.score - a.score || a.e.name.localeCompare(b.e.name))
     .slice(0, limit)
     .map(x => x.e);
 }
 
-// ---------- search ----------
+// ---------- query parsing ----------
 
 // edit distance between two words, stopping early once it passes the limit
 function distance(a, b, limit = 2) {
@@ -141,45 +230,85 @@ function distance(a, b, limit = 2) {
   return prev[b.length];
 }
 
-// turn the search box into terms. supports "quoted phrases", -not, and field:value
+// turn the search box into groups of terms. groups are split by | and mean "or".
+// inside a group every term must match. supports "phrases", -not, field:value, and scale compares like size>=large
 function parse(text) {
-  const terms = [];
-  const re = /(-)?(?:(\w+):)?(?:"([^"]+)"|(\S+))/g;
-  let m;
-  while ((m = re.exec(text.toLowerCase()))) {
-    const field = m[2] && m[2] in fields ? m[2] : null;
-    const word = m[3] || m[4] || "";
-    if (!word) continue;
-    terms.push({ not: !!m[1], field, word: m[2] && !field ? m[2] + ":" + word : word, phrase: !!m[3] });
-  }
-  return terms;
+  return text.toLowerCase().split("|").map(part => {
+    const terms = [];
+    const re = /(-)?(?:(\w+)(:|>=|<=|>|<|=))?(?:"([^"]+)"|(\S+))/g;
+    let m;
+    while ((m = re.exec(part))) {
+      const [, not, key, op, phrase, bare] = m;
+      const word = phrase || bare || "";
+      if (!word) continue;
+      if (key && op !== ":" && key in scales) {
+        terms.push({ not: !!not, scale: key, op, value: word.replace(/-/g, " ") });
+      } else if (key && key in fields) {
+        terms.push({ not: !!not, field: key, word, phrase: !!phrase });
+      } else {
+        terms.push({ not: !!not, field: null, word: key ? key + op + word : word, phrase: !!phrase });
+      }
+    }
+    return terms;
+  }).filter(g => g.length);
 }
 
-// score one term against one entry. exact hits beat fuzzy ones. 0 means no match
-function termScore(term, f) {
+// compare two positions on an ordered scale
+const compare = { ">": (a, b) => a > b, "<": (a, b) => a < b, ">=": (a, b) => a >= b, "<=": (a, b) => a <= b, "=": (a, b) => a === b };
+
+// score one term against one entry. exact hits beat synonyms, synonyms beat typos. 0 means no match
+function termScore(term, e, f) {
+  if (term.scale) {
+    const list = scales[term.scale];
+    const want = list.indexOf(term.value);
+    if (want < 0) return 0;
+    return compare[term.op](list.indexOf(e[term.scale]), want) ? 1 : 0;
+  }
   const places = term.field ? [term.field] : Object.keys(fields);
-  let best = 0;
-  for (const k of places) {
-    if (f[k].includes(term.word)) best = Math.max(best, weights[k]);
+  const hit = w => places.reduce((best, k) => f[k].includes(w) ? Math.max(best, weights[k]) : best, 0);
+
+  let best = hit(term.word);
+  if (!best && !term.phrase) {
+    for (const s of synonymOf.get(term.word) || []) best = Math.max(best, hit(s) * 0.7);
   }
   // allow small typos on single longer words
-  if (!best && !term.phrase && term.word.length >= 4 && !term.field) {
+  if (!best && !term.phrase && !term.field && term.word.length >= 4) {
     const limit = term.word.length >= 7 ? 2 : 1;
     for (const w of f.words) if (distance(term.word, w, limit) <= limit) { best = 0.5; break; }
   }
   return best;
 }
 
-// total score for an entry, or -1 if it should be hidden
-function score(e, terms) {
-  const f = index.get(e.id);
+// score one group of terms, or -1 if any term fails
+function groupScore(group, e, f) {
   let total = 0;
-  for (const t of terms) {
-    const s = termScore(t, f);
+  for (const t of group) {
+    const s = termScore(t, e, f);
     if (t.not ? s > 0 : s === 0) return -1;
-    total += s;
+    total += t.not ? 0 : s;
   }
   return total;
+}
+
+// best score over all "or" groups, or -1 if none match. no query means everything matches
+function score(e, groups) {
+  if (!groups.length) return 0;
+  const f = index.get(e.id);
+  return Math.max(-1, ...groups.map(g => groupScore(g, e, f)));
+}
+
+// quick pre-filter using the inverted index. only safe for plain exact words with no field
+function candidates(groups) {
+  if (groups.length !== 1) return null;
+  const plain = groups[0].filter(t => !t.not && !t.field && !t.scale && !t.phrase && postings.has(t.word) && !synonymOf.has(t.word));
+  if (!plain.length) return null;
+  let set = null;
+  for (const t of plain) {
+    const ids = new Set();
+    for (const [w, list] of postings) if (w.includes(t.word)) for (const id of list) ids.add(id);
+    set = set ? new Set([...set].filter(id => ids.has(id))) : ids;
+  }
+  return set;
 }
 
 // ---------- form state ----------
@@ -190,7 +319,7 @@ const keys = ["q", "group", "flight", "tag", "sort", "view"];
 function state() {
   const f = new FormData(form);
   const s = Object.fromEntries(keys.map(k => [k, f.get(k) || ""]));
-  s.terms = parse(s.q);
+  s.groups = parse(s.q);
   return s;
 }
 
@@ -209,14 +338,18 @@ function load() {
 function passes(e, s) {
   return (!s.group || e.group === s.group) &&
     (!s.flight || e.flight === s.flight) &&
-    (!s.tag || e.tags.includes(s.tag));
+    (!s.tag || e.allTags.has(s.tag));
 }
 
+const byName = (a, b) => a.name.localeCompare(b.name);
+const byScale = k => (a, b) => scales[k].indexOf(a[k]) - scales[k].indexOf(b[k]) || byName(a, b);
 const sorters = {
-  name: (a, b) => a.name.localeCompare(b.name),
-  flight: (a, b) => a.flight.localeCompare(b.flight) || a.name.localeCompare(b.name),
-  material: (a, b) => a.material.localeCompare(b.material) || a.name.localeCompare(b.name),
-  tags: (a, b) => b.tags.length - a.tags.length || a.name.localeCompare(b.name)
+  name: byName,
+  flight: (a, b) => a.flight.localeCompare(b.flight) || byName(a, b),
+  material: (a, b) => a.material.localeCompare(b.material) || byName(a, b),
+  tags: (a, b) => b.tags.length - a.tags.length || byName(a, b),
+  size: byScale("size"),
+  speed: byScale("speed")
 };
 
 // ---------- html helpers ----------
@@ -229,13 +362,14 @@ const glossRe = new RegExp("\\b(" + Object.keys(glossary).sort((a, b) => b.lengt
 const gloss = text => esc(text).replace(glossRe, w => `<abbr title="${esc(glossary[w])}">${w}</abbr>`);
 
 // fill a select box with options and counts
-function fill(name, pairs) {
+function fill(name, pairs, label = v => v) {
   const sel = form.elements[name];
-  for (const [v, n] of pairs) sel.add(new Option(`${v} (${n})`, v));
+  for (const [v, n] of pairs) sel.add(new Option(`${label(v)} (${n})`, v));
 }
-fill("group", tally("group"));
-fill("flight", tally("flight"));
-fill("tag", tally("tags"));
+fill("group", tally(e => [e.group]));
+fill("flight", tally(e => [e.flight]));
+fill("tag", tally(e => e.allTags), t => t in tagParents ? t + " (all)" : t);
+for (const k of ["size", "speed"]) form.elements.sort.add(new Option("by " + k, k));
 
 const out = document.getElementById("out");
 const count = document.getElementById("count");
@@ -263,11 +397,25 @@ function drawList(rows) {
 
 // table view: one row per entry
 function drawTable(rows) {
-  const head = ["name", "group", "subgroup", "flight", "material", "tags"];
-  return `<table border="1" cellpadding="4"><tr>${head.map(h => `<th>${h}</th>`).join("")}</tr>` +
-    rows.map(({ e }) => `<tr><td>${link(e)}</td><td>${esc(e.group)}</td><td>${esc(e.subgroup)}</td>` +
-      `<td>${esc(e.flight)}</td><td>${esc(e.material)}</td><td>${esc(e.tags.join(", "))}</td></tr>`).join("") +
+  const cols = [
+    ["name", e => link(e)],
+    ["group", e => esc(e.group)],
+    ["flight", e => esc(e.flight)],
+    ["material", e => esc(e.material)],
+    ["size", e => esc(e.size)],
+    ["speed", e => esc(e.speed)],
+    ["aspect", e => esc(e.aspect)],
+    ["tags", e => esc(e.tags.join(", "))]
+  ];
+  return `<table border="1" cellpadding="4"><tr>${cols.map(([h]) => `<th>${h}</th>`).join("")}</tr>` +
+    rows.map(({ e }) => `<tr>${cols.map(([, f]) => `<td>${f(e)}</td>`).join("")}</tr>`).join("") +
     `</table>`;
+}
+
+// where an entry ranks among all entries on one scale, like "4th of 20 large wings"
+function scaleNote(e, k) {
+  const same = all.filter(x => x[k] === e[k]).length;
+  return `${esc(e[k])} (${same} wings share this)`;
 }
 
 // detail view for one entry, opened by #id in the url
@@ -277,6 +425,8 @@ function drawDetail(e) {
   const far = [...walk(e.id, 3)].filter(([, v]) => v.depth > 1).sort((a, b) => a[1].depth - b[1].depth);
   const pathText = path => path.map(id => link(byId.get(id))).join(" &rarr; ");
   const sameMaterial = all.filter(x => x.material === e.material && x.id !== e.id).length;
+  const rel = related(e);
+  const parents = [...e.allTags].filter(t => !e.tags.includes(t));
 
   return `<p><a href="#">back</a></p>
 <h2>${esc(e.name)}</h2>
@@ -286,32 +436,67 @@ function drawDetail(e) {
 <dt>examples</dt><dd>${esc(e.examples.join(", "))}</dd>
 <dt>flight</dt><dd>${esc(e.flight)}: ${esc(flightModes[e.flight] || "")}</dd>
 <dt>material</dt><dd>${esc(e.material)}${m ? ` (${m.origin}, ${m.weight}, ${m.stiffness} stiffness): ${esc(m.note)} used by ${sameMaterial} other wings.` : ""}</dd>
-<dt>tags</dt><dd>${esc(e.tags.join(", "))}</dd>
+<dt>size</dt><dd>${scaleNote(e, "size")}</dd>
+<dt>speed</dt><dd>${scaleNote(e, "speed")}</dd>
+<dt>aspect</dt><dd>${scaleNote(e, "aspect")}</dd>
+<dt>tags</dt><dd>${esc(e.tags.join(", "))}${parents.length ? ` (also counts as: ${esc(parents.join(", "))})` : ""}</dd>
+<dt>link cluster</dt><dd>${clusterOf.has(e.id) ? `connected to ${clusterSize(e.id) - 1} other wings` : "not linked to any wing"}</dd>
 </dl>
 <h3>links</h3>
 <ul>${direct.map(l => `<li>${esc(l.type)} ${link(byId.get(l.to))}</li>`).join("") || "<li>none</li>"}</ul>
 <h3>further links</h3>
 <ul>${far.map(([, v]) => `<li>${pathText(v.path)}</li>`).join("") || "<li>none</li>"}</ul>
 <h3>related</h3>
-<ul>${related(e).map(r => `<li>${link(r)}</li>`).join("") || "<li>none</li>"}</ul>`;
+<ul>${rel.map(r => `<li>${link(r)} (<a href="#${e.id},${r.id}">compare</a>)</li>`).join("") || "<li>none</li>"}</ul>`;
+}
+
+// side by side view for two entries, opened by #a,b in the url
+function drawCompare(a, b) {
+  const rows = [
+    ["group", e => esc(e.group + " / " + e.subgroup)],
+    ["about", e => gloss(e.note)],
+    ["flight", e => esc(e.flight)],
+    ["material", e => esc(e.material)],
+    ["size", e => esc(e.size)],
+    ["speed", e => esc(e.speed)],
+    ["aspect", e => esc(e.aspect)],
+    ["tags", e => esc(e.tags.join(", "))]
+  ];
+  const shared = a.tags.filter(t => b.tags.includes(t));
+  const hop = walk(a.id, 6).get(b.id);
+  return `<p><a href="#${a.id}">back</a></p>
+<h2>${esc(a.name)} vs ${esc(b.name)}</h2>
+<table border="1" cellpadding="4">
+<tr><th></th><th>${link(a)}</th><th>${link(b)}</th></tr>
+${rows.map(([h, f]) => `<tr><th>${h}</th><td>${f(a)}</td><td>${f(b)}</td></tr>`).join("\n")}
+</table>
+<p>shared tags: ${esc(shared.join(", ") || "none")}</p>
+<p>similarity: ${Math.round(cosine(a.id, b.id) * 100)}%</p>
+<p>link path: ${hop ? hop.path.map(id => link(byId.get(id))).join(" &rarr; ") : "none"}</p>`;
 }
 
 function draw() {
-  const picked = byId.get(location.hash.slice(1));
-  form.hidden = !!picked;
-  if (picked) { count.textContent = ""; out.innerHTML = drawDetail(picked); return; }
+  const ids = decodeURIComponent(location.hash.slice(1)).split(",").map(id => byId.get(id));
+  const picked = ids.every(Boolean) ? ids : [];
+  form.hidden = picked.length > 0;
+  if (picked.length) {
+    count.textContent = "";
+    out.innerHTML = picked.length >= 2 ? drawCompare(picked[0], picked[1]) : drawDetail(picked[0]);
+    return;
+  }
 
   const s = state();
   save(s);
+  const pool = candidates(s.groups);
   const rows = all
-    .filter(e => passes(e, s))
-    .map(e => ({ e, score: score(e, s.terms) }))
+    .filter(e => (!pool || pool.has(e.id)) && passes(e, s))
+    .map(e => ({ e, score: score(e, s.groups) }))
     .filter(r => r.score >= 0);
 
   // any sort other than by group switches to the table
   const sorted = s.sort in sorters;
   if (sorted) rows.sort((a, b) => sorters[s.sort](a.e, b.e));
-  else if (s.view === "table" && s.terms.length) rows.sort((a, b) => b.score - a.score);
+  else if (s.view === "table" && s.groups.length) rows.sort((a, b) => b.score - a.score);
 
   count.textContent = `${rows.length} of ${all.length} wings`;
   out.innerHTML = !rows.length ? "<p>no wings found.</p>"
