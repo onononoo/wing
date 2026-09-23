@@ -90,6 +90,27 @@ function expandTags(tags) {
 }
 for (const e of all) e.allTags = expandTags(e.tags);
 
+// attach sources from sources.js. each cite keeps what it supports plus the full source record
+const supportKinds = ["overview", "shape", "parts", "biology", "history", "physics", "name"];
+for (const e of all) {
+  e.cites = (cites[e.id] || [])
+    .filter(([key]) => key in sources)
+    .map(([key, supports]) => ({ key, supports, ...sources[key] }));
+}
+
+// how well backed an entry is: none, thin (one general source), or solid
+function sourceStrength(e) {
+  if (!e.cites.length) return "none";
+  const expert = e.cites.some(c => publishers[c.publisher]?.tier === "expert");
+  const kinds = new Set(e.cites.map(c => c.supports));
+  return expert || e.cites.length >= 2 || kinds.size >= 2 ? "solid" : "thin";
+}
+for (const e of all) e.strength = sourceStrength(e);
+
+// source key -> ids of the wings that cite it
+const citedBy = new Map(Object.keys(sources).map(k => [k, []]));
+for (const e of all) for (const c of e.cites) citedBy.get(c.key).push(e.id);
+
 // word -> every word that means the same
 const synonymOf = new Map();
 for (const set of synonyms) for (const w of set) synonymOf.set(w, set.filter(x => x !== w));
@@ -113,7 +134,20 @@ for (const set of synonyms) for (const w of set) synonymOf.set(w, set.filter(x =
   }
   for (const [env, ids] of Object.entries(environments)) for (const id of ids) if (!byId.has(id)) warn("environment " + env + " for missing id", id);
   for (const [id, f] of Object.entries(fluidOf)) if (!(f in fluids)) warn("unknown fluid", id, f);
-  for (const [name, table] of [["span", spans], ["era", eraOf], ["facts", facts], ["tag patch", tagPatches], ["parts", parts], ["tradeoffs", tradeoffs], ["fluid", fluidOf]]) {
+  // every wing, now and later, must cite at least one source
+  for (const e of all) if (!e.cites.length) console.error("wing db: no source for", e.id, "- add one to cites in sources.js");
+  for (const [id, list] of Object.entries(cites)) {
+    for (const [key, supports] of list) {
+      if (!(key in sources)) warn("cite to unknown source", id, key);
+      if (!supportKinds.includes(supports)) warn("unknown support kind", id, supports);
+    }
+  }
+  for (const [key, s] of Object.entries(sources)) {
+    if (!(s.publisher in publishers)) warn("unknown publisher", key, s.publisher);
+    if (!/^https:\/\//.test(s.url)) warn("source url is not https", key);
+  }
+  for (const keys of Object.values(tableCites)) for (const k of keys) if (!(k in sources)) warn("table cite to unknown source", k);
+  for (const [name, table] of [["cites", cites], ["span", spans], ["era", eraOf], ["facts", facts], ["tag patch", tagPatches], ["parts", parts], ["tradeoffs", tradeoffs], ["fluid", fluidOf]]) {
     for (const id in table) if (!byId.has(id)) warn(name + " for missing id", id);
   }
   for (const [a, , b] of links) if (!byId.has(a) || !byId.has(b)) warn("broken link", a, b);
@@ -149,12 +183,13 @@ const fields = {
   part: e => e.partNames.join(" "),
   pro: e => e.pros.join(" "),
   con: e => e.cons.join(" "),
+  source: e => e.cites.map(c => c.publisher + " " + c.title).join(" ") + " " + e.strength,
   flow: e => e.flow || "",
   fluid: e => e.fluid,
   id: e => e.id
 };
 // how much a hit in each field counts toward the score
-const weights = { name: 5, id: 4, tag: 3, example: 3, env: 2, part: 2, group: 2, flight: 2, material: 2, flow: 1, fluid: 1, size: 1, speed: 1, aspect: 1, era: 1, note: 1, pro: 1, con: 1, fact: 0.5 };
+const weights = { name: 5, id: 4, tag: 3, example: 3, env: 2, part: 2, group: 2, flight: 2, material: 2, flow: 1, fluid: 1, size: 1, speed: 1, aspect: 1, era: 1, note: 1, pro: 1, con: 1, fact: 0.5, source: 0.5 };
 
 // ---------- measurements ----------
 
@@ -558,7 +593,7 @@ function drawList(rows) {
     if (group !== lastG) { html += `<h2>${esc(group)}</h2>`; lastG = group; }
     html += `<h3>${esc(subgroup)}</h3>`;
     list.sort((a, b) => b.score - a.score);
-    for (const { e } of list) html += `<p>${link(e)}: ${gloss(e.note)}</p>`;
+    for (const { e } of list) html += `<p>${link(e)}: ${gloss(e.note)}${e.cites.length ? "" : " [no source]"}</p>`;
   }
   return html;
 }
@@ -668,10 +703,13 @@ function drawDetail(e) {
 <dt>found in</dt><dd>${envNote(e)}</dd>
 <dt>flow</dt><dd>${flowNote(e)}</dd>
 <dt>link cluster</dt><dd>${clusterOf.has(e.id) ? `connected to ${clusterSize(e.id) - 1} other wings` : "not linked to any wing"}</dd>
+<dt>sourcing</dt><dd>${e.strength} (${e.cites.length} ${e.cites.length === 1 ? "source" : "sources"})</dd>
 </dl>
 ${e.parts.length ? `<h3>parts</h3>\n${drawParts(e.parts)}` : ""}
 ${e.pros.length || e.cons.length ? `<h3>good and bad</h3>\n<ul>${e.pros.map(p => `<li>+ ${esc(p)}</li>`).join("")}${e.cons.map(c => `<li>- ${esc(c)}</li>`).join("")}</ul>` : ""}
 ${e.facts.length ? `<h3>facts</h3>\n<ul>${e.facts.map(f => `<li>${gloss(f)}</li>`).join("")}</ul>` : ""}
+<h3>sources</h3>
+${drawRefs(e)}
 <h3>links</h3>
 <ul>${direct.map(l => `<li>${esc(l.type)} ${link(byId.get(l.to))}</li>`).join("") || "<li>none</li>"}</ul>
 <h3>further links</h3>
@@ -716,10 +754,66 @@ ${rows.map(([h, f]) => `<tr><th>${h}</th><td>${f(a)}</td><td>${f(b)}</td></tr>`)
 <p>shared parts: ${esc(a.partNames.filter(p => b.partNames.includes(p)).join(", ") || "none")}</p>
 <p>shared places: ${esc(a.env.filter(p => b.env.includes(p)).join(", ") || "none")}</p>
 <p>similarity: ${Math.round(cosine(a.id, b.id) * 100)}%</p>
-<p>link path: ${hop ? hop.path.map(id => link(byId.get(id))).join(" &rarr; ") : "none"}</p>`;
+<p>link path: ${hop ? hop.path.map(id => link(byId.get(id))).join(" &rarr; ") : "none"}</p>
+<p>shared sources: ${a.cites.filter(c => b.cites.some(d => d.key === c.key)).map(sourceLink).join(", ") || "none"}</p>
+<h3>sources</h3>
+${drawRefs(a)}
+${drawRefs(b)}`;
+}
+
+// one source as a link, with its publisher
+const sourceLink = s => `<a href="${esc(s.url)}">${esc(s.title)}</a> (${esc(s.publisher)})`;
+
+// numbered reference list for one entry, grouped by what each source supports
+function drawRefs(e) {
+  if (!e.cites.length) return `<p>${esc(e.name)}: no source yet.</p>`;
+  const byKind = new Map();
+  e.cites.forEach((c, i) => {
+    if (!byKind.has(c.supports)) byKind.set(c.supports, []);
+    byKind.get(c.supports).push(`[${i + 1}] ${sourceLink(c)}`);
+  });
+  return `<p>${esc(e.name)}:</p><ul>${[...byKind].map(([k, list]) => `<li>${esc(k)}: ${list.join("; ")}</li>`).join("")}</ul>`;
+}
+
+// the sources page: every source, who cites it, table sources, and coverage numbers
+function drawSources() {
+  const covered = all.filter(e => e.cites.length).length;
+  const byStrength = tally(e => [e.strength]);
+  const bySupport = tally(e => [...new Set(e.cites.map(c => c.supports))]);
+  const byPublisher = tally(e => [...new Set(e.cites.map(c => c.publisher))]);
+  const unused = Object.keys(sources).filter(k => !citedBy.get(k).length && !Object.values(tableCites).flat().includes(k));
+  const missing = all.filter(e => !e.cites.length);
+  const keys = Object.keys(sources).sort((a, b) => citedBy.get(b).length - citedBy.get(a).length || sources[a].title.localeCompare(sources[b].title));
+  const list = pairs => pairs.map(([k, n]) => `${esc(k)} (${n})`).join(", ");
+
+  return `<p><a href="#">back</a></p>
+<h2>sources</h2>
+<dl>
+<dt>coverage</dt><dd>${covered} of ${all.length} wings have at least one source.</dd>
+<dt>strength</dt><dd>${list(byStrength)}</dd>
+<dt>what they back</dt><dd>${list(bySupport)}</dd>
+<dt>publishers</dt><dd>${list(byPublisher)}</dd>
+${missing.length ? `<dt>missing</dt><dd>${missing.map(link).join(", ")}</dd>` : ""}
+</dl>
+<h3>publishers</h3>
+<ul>${Object.entries(publishers).map(([name, p]) => `<li>${esc(name)}: ${esc(p.kind)}, ${esc(p.tier)}. ${esc(p.note)}</li>`).join("")}</ul>
+<h3>shared tables</h3>
+<ul>${Object.entries(tableCites).map(([t, ks]) => `<li>${esc(t)}: ${ks.map(k => sourceLink(sources[k])).join("; ")}</li>`).join("")}</ul>
+<h3>all sources (${keys.length})</h3>
+<ol>${keys.map(k => {
+    const ids = citedBy.get(k);
+    return `<li>${sourceLink(sources[k])}${ids.length ? ` used by ${ids.map(id => link(byId.get(id))).join(", ")}` : " used by shared tables"}</li>`;
+  }).join("")}</ol>
+${unused.length ? `<p>not used anywhere: ${esc(unused.join(", "))}</p>` : ""}`;
 }
 
 function draw() {
+  if (location.hash === "#sources") {
+    form.hidden = true;
+    count.textContent = "";
+    out.innerHTML = drawSources();
+    return;
+  }
   const ids = decodeURIComponent(location.hash.slice(1)).split(",").map(id => byId.get(id));
   const picked = ids.every(Boolean) ? ids : [];
   form.hidden = picked.length > 0;
