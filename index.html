@@ -1,17 +1,32 @@
 <!doctype html>
 <html lang="en">
 <head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>wing database</title>
-  <link rel="stylesheet" href="style.css">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>wing database</title>
 </head>
 <body>
-  <h1>wing database</h1>
-  <p class="sub">kinds of wings, grouped by type.</p>
-  <input id="search" type="search" placeholder="search wings...">
-  <main id="list"></main>
-  <script src="data.js"></script>
-  <script src="app.js"></script>
+<h1>wing database</h1>
+<p>kinds of wings, grouped by type.</p>
+<form id="filters">
+search: <input name="q" type="search">
+group: <select name="group"><option value="">all</option></select>
+flight: <select name="flight"><option value="">all</option></select>
+tag: <select name="tag"><option value="">all</option></select>
+sort: <select name="sort">
+<option value="default">by group</option>
+<option value="name">by name</option>
+<option value="flight">by flight</option>
+<option value="material">by material</option>
+<option value="tags">by tag count</option>
+</select>
+view: <select name="view"><option value="list">list</option><option value="table">table</option></select>
+<input type="reset" value="clear">
+</form>
+<p id="count"></p>
+<hr>
+<div id="out"></div>
+<script src="data.js"></script>
+<script src="app.js"></script>
 </body>
 </html>
